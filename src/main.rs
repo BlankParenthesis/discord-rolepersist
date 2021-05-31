@@ -1,17 +1,22 @@
 use std::fs;
 use std::fmt;
+use std::sync::{Arc, Weak};
 
 use rusqlite::{Connection, Result};
 
+use std::future::Future;
+
 use serenity::{async_trait, prelude::*};
 use serenity::model::gateway::Ready;
-use serenity::model::id::{GuildId, RoleId};
+use serenity::model::id::{UserId, GuildId, RoleId};
 use serenity::model::guild::Member;
 use serenity::model::event::GuildMemberUpdateEvent;
 use serenity::client::bridge::gateway::GatewayIntents;
 
 use serde::Deserialize;
 use serde::de::{Deserializer, Visitor};
+
+use weak_table::WeakValueHashMap;
 
 struct SimpleMember {
     joined_at: i64,
@@ -45,6 +50,7 @@ impl From<&GuildMemberUpdateEvent> for SimpleMember {
 struct Handler {
     data: Mutex<Connection>,
     config: Config,
+    member_locks: Mutex<WeakValueHashMap<(UserId, GuildId), Weak<Mutex<()>>>>,
 }
 
 impl Handler {
@@ -73,6 +79,7 @@ impl Handler {
         Ok(Self {
             data: Mutex::new(connection),
             config,
+            member_locks: Mutex::new(WeakValueHashMap::new()),
         })
     }
 
@@ -166,6 +173,31 @@ impl Handler {
             true
         }
     } 
+
+    pub async fn do_locked<
+        F: Future<Output = ()>,
+        FN: FnOnce() -> F,
+    >(
+        &self, 
+        user_id: UserId, 
+        guild_id: GuildId, 
+        function: FN
+    ) {
+        let key = (user_id, guild_id);
+        let mut locks = self.member_locks.lock().await;
+
+        if let Some(user_lock) = locks.get(&key) {
+            std::mem::drop(locks);
+            let _lock = user_lock.lock().await;
+            function().await
+        } else {
+            let user_lock = Arc::new(Mutex::new(()));
+            locks.insert(key, user_lock.clone());
+            let _lock = user_lock.lock().await;
+            std::mem::drop(locks);
+            function().await
+        }
+    }
 }
 
 #[async_trait]
@@ -201,7 +233,13 @@ impl EventHandler for Handler {
         member: Member
     ) {
         if self.filter_allow_server(guild_id) {
-            self.restore_member(&context, member).await;
+            self.do_locked(
+                member.user.id, 
+                guild_id, 
+                || async { 
+                    self.restore_member(&context, member).await 
+                },
+            ).await;
         }
     }
     
@@ -211,7 +249,13 @@ impl EventHandler for Handler {
         update: GuildMemberUpdateEvent
     ) {
         if self.filter_allow_server(update.guild_id) {
-            self.save_member(&(&update).into()).await;
+            self.do_locked(
+                update.user.id, 
+                update.guild_id, 
+                || async { 
+                    self.save_member(&(&update).into()).await;
+                }
+            ).await;
         }
     }
 }
