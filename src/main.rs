@@ -9,7 +9,7 @@ use std::future::Future;
 use serenity::{async_trait, prelude::*};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{UserId, GuildId, RoleId};
-use serenity::model::guild::Member;
+use serenity::model::guild::{Member, Guild, GuildUnavailable};
 use serenity::model::event::GuildMemberUpdateEvent;
 use serenity::client::bridge::gateway::GatewayIntents;
 
@@ -166,6 +166,37 @@ impl Handler {
         self.save_member(&simple_member).await;
     }
 
+    pub async fn save_guild(&self, context: &Context, server_id: GuildId) -> std::result::Result<(), serenity::Error> {
+        let result = context.http.get_guild_members(server_id.0, None, None).await;
+
+        match result {
+            Ok(members) => {
+                for member in members {
+                    self.observe_member(context, member).await
+                }
+                Ok(())
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn forget_guild(&self, server_id: GuildId) {
+        let mut connection = (&self.data).lock().await;
+        let transaction = connection.transaction().unwrap();
+
+        transaction.execute(
+            "DELETE FROM roles WHERE server_id=?2",
+            [server_id.0],
+        ).unwrap();
+
+        transaction.execute(
+            "DELETE FROM last_seen WHERE server_id=?2",
+            [server_id.0],
+        ).unwrap();
+
+        transaction.commit().unwrap();
+    }
+
     pub fn filter_allow_server(&self, id: GuildId) -> bool {
         if let Some(restrict) = &self.config.restrict {
             restrict.is_restricted(id.0)
@@ -207,23 +238,27 @@ impl EventHandler for Handler {
         context: Context, 
         ready: Ready
     ) {
-        let futures: Vec<_> = ready.guilds.into_iter()
+        let guilds: Vec<_> = ready.guilds.into_iter()
             .filter(|guild| self.filter_allow_server(guild.id()))
-            .map(|guild| (&context).http.get_guild_members(guild.id().0, None, None))
             .collect();
         
-        let member_lists = futures::future::join_all(futures).await;
-
-        for result in member_lists {
-            match result {
-                Ok(members) => {
-                    for member in members {
-                        self.observe_member(&context, member).await;
-                    }
-                },
-                Err(error) => println!("Error fetching some members: {}", error),
+        for guild in guilds {
+            if let Err(error) = self.save_guild(&context, guild.id()).await {
+                println!("Error fetching members of guild {}: {}", guild.id(), error);
             }
         }
+    }
+
+    async fn guild_create(&self, context: Context, guild: Guild) {
+        if self.filter_allow_server(guild.id) {
+            if let Err(error) = self.save_guild(&context, guild.id).await {
+                println!("Error fetching members of guild {}: {}", guild.id.0, error);
+            }
+        }
+    }
+
+    async fn guild_delete(&self, _context: Context, guild: GuildUnavailable) {
+        self.forget_guild(guild.id).await;
     }
         
     async fn guild_member_addition(
