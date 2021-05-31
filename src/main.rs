@@ -1,5 +1,5 @@
-use std::env;
 use std::fs;
+use std::fmt;
 
 use rusqlite::{Connection, Result};
 
@@ -11,6 +11,7 @@ use serenity::model::event::GuildMemberUpdateEvent;
 use serenity::client::bridge::gateway::GatewayIntents;
 
 use serde::Deserialize;
+use serde::de::{Deserializer, Visitor};
 
 struct SimpleMember {
     joined_at: i64,
@@ -157,6 +158,14 @@ impl Handler {
 
         self.save_member(&simple_member).await;
     }
+
+    pub fn filter_allow_server(&self, id: GuildId) -> bool {
+        if let Some(restrict) = &self.config.restrict {
+            restrict.is_restricted(id.0)
+        } else {
+            true
+        }
+    } 
 }
 
 #[async_trait]
@@ -167,6 +176,7 @@ impl EventHandler for Handler {
         ready: Ready
     ) {
         let futures: Vec<_> = ready.guilds.into_iter()
+            .filter(|guild| self.filter_allow_server(guild.id()))
             .map(|guild| (&context).http.get_guild_members(guild.id().0, None, None))
             .collect();
         
@@ -187,10 +197,12 @@ impl EventHandler for Handler {
     async fn guild_member_addition(
         &self, 
         context: Context, 
-        _guild_id: GuildId, 
+        guild_id: GuildId, 
         member: Member
     ) {
-        self.restore_member(&context, member).await;
+        if self.filter_allow_server(guild_id) {
+            self.restore_member(&context, member).await;
+        }
     }
     
     async fn guild_member_update(
@@ -198,13 +210,66 @@ impl EventHandler for Handler {
         _context: Context, 
         update: GuildMemberUpdateEvent
     ) {
-        self.save_member(&(&update).into()).await;
+        if self.filter_allow_server(update.guild_id) {
+            self.save_member(&(&update).into()).await;
+        }
+    }
+}
+
+enum RestrictionMode {
+    Allow,
+    Deny,
+}
+
+struct RestrictionVisitor;
+
+impl<'de> Visitor<'de> for RestrictionVisitor {
+    type Value = RestrictionMode;
+    
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("the string 'allow' or the string 'deny'")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> 
+    where E: serde::de::Error {
+        match value {
+            "allow" => Ok(RestrictionMode::Allow),
+            "deny" => Ok(RestrictionMode::Deny),
+            _ => Err(E::custom(format!("{} is not a restriction mode", value))),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RestrictionMode {
+    fn deserialize<D>(deserializer: D) -> Result<RestrictionMode, D::Error>
+
+    where D: Deserializer<'de> {
+        deserializer.deserialize_str(RestrictionVisitor)
+    }
+}
+
+#[derive(Deserialize)]
+struct Restriction {
+    mode: RestrictionMode,
+    servers: Vec<u64>,
+}
+
+impl Restriction {
+    pub fn is_restricted(&self, server_id: u64) -> bool {
+        let is_listed = (&self.servers).into_iter()
+            .find(|id| **id == server_id);
+        
+        match self.mode {
+            RestrictionMode::Allow => is_listed.is_some(),
+            RestrictionMode::Deny => is_listed.is_none(),
+        }
     }
 }
 
 #[derive(Deserialize)]
 struct Config {
     token: String,
+    restrict: Option<Restriction>
 }
 
 #[tokio::main]

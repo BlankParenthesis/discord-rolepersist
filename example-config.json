@@ -1,3 +1,7 @@
 {
-	"token": "abcdef.123.456789"
+	"token": "abcdef.123.456789",
+	"restrict": {
+		"mode": "allow",
+		"servers": [123456789]
+	}
 }
