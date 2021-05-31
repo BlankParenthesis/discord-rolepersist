@@ -1,0 +1,11 @@
+[package]
+name = "discord-rolepersist"
+version = "0.1.0"
+authors = ["[  ] <blank.parenthesis@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+serenity = { version = "0.10.7", default-features = false, features = ["client", "gateway", "rustls_backend", "model"] }
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+rusqlite = "0.25.3"
+futures = "0.3.15"
