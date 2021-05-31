@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 
 use rusqlite::{Connection, Result};
 
@@ -8,6 +9,8 @@ use serenity::model::id::{GuildId, RoleId};
 use serenity::model::guild::Member;
 use serenity::model::event::GuildMemberUpdateEvent;
 use serenity::client::bridge::gateway::GatewayIntents;
+
+use serde::Deserialize;
 
 struct SimpleMember {
     joined_at: i64,
@@ -40,10 +43,11 @@ impl From<&GuildMemberUpdateEvent> for SimpleMember {
 
 struct Handler {
     data: Mutex<Connection>,
+    config: Config,
 }
 
 impl Handler {
-    pub fn new() -> Result<Self> {
+    pub fn new(config: Config) -> Result<Self> {
         let connection = Connection::open("data.db")?;
 
         connection.execute(
@@ -67,6 +71,7 @@ impl Handler {
 
         Ok(Self {
             data: Mutex::new(connection),
+            config,
         })
     }
 
@@ -197,12 +202,21 @@ impl EventHandler for Handler {
     }
 }
 
+#[derive(Deserialize)]
+struct Config {
+    token: String,
+}
+
 #[tokio::main]
 async fn main() {
-    let token = env::var("DISCORD_TOKEN")
-        .expect("Expected DISCORD_TOKEN environment variable");
+    let config_contents = fs::read_to_string("config.json")
+        .expect("Unable to read config file");
+    let config: Config = serde_json::from_str(&config_contents)
+        .expect("Unable to parse config file");
 
-    let handler = Handler::new().unwrap();
+    let token = config.token.clone();
+        
+    let handler = Handler::new(config).unwrap();
 
     let mut client = Client::builder(&token)
         .intents(GatewayIntents::GUILDS | GatewayIntents::GUILD_MEMBERS)
