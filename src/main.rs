@@ -22,7 +22,7 @@ struct SimpleMember {
     joined_at: i64,
     user_id: u64,
     server_id: u64,
-    roles: Vec<u64>
+    roles: Vec<u64>,
 }
 
 impl From<&Member> for SimpleMember {
@@ -36,6 +36,12 @@ impl From<&Member> for SimpleMember {
     }
 }
 
+impl From<Member> for SimpleMember {
+    fn from(member: Member) -> Self {
+        Self::from(&member)
+    }
+}
+
 impl From<&GuildMemberUpdateEvent> for SimpleMember {
     fn from(member: &GuildMemberUpdateEvent) -> Self {
         SimpleMember {
@@ -44,6 +50,12 @@ impl From<&GuildMemberUpdateEvent> for SimpleMember {
             server_id: member.guild_id.0,
             roles: member.roles.clone().into_iter().map(|r| r.0).collect(),
         }
+    }
+}
+
+impl From<GuildMemberUpdateEvent> for SimpleMember {
+    fn from(member: GuildMemberUpdateEvent) -> Self {
+        Self::from(&member)
     }
 }
 
@@ -89,6 +101,7 @@ impl Handler {
 
         let mut connection = (&self.data).lock().await;
         let transaction = connection.transaction().unwrap();
+
         transaction.execute(
             "REPLACE INTO last_seen (user_id, server_id, time) VALUES (?1, ?2, ?3)",
             [member.user_id, member.server_id, since_epoch.as_secs()],
@@ -109,8 +122,11 @@ impl Handler {
         transaction.commit().unwrap();
     }
 
-    pub async fn restore_member(&self, context: &Context, mut member: Member) {
-        let simple_member = SimpleMember::from(&member);
+    pub async fn restore_member(
+        &self, 
+        context: &Context, 
+        member: &mut SimpleMember
+    ) {
         let connection = (&self.data).lock().await;
         let roles: Vec<RoleId>;
         {
@@ -120,50 +136,62 @@ impl Handler {
             ).unwrap();
 
             roles = roles_query.query_map(
-                [simple_member.user_id, simple_member.server_id],
+                [member.user_id, member.server_id],
                 |row| Ok(RoleId(row.get(0)?))
             ).unwrap().collect::<Result<_>>().unwrap();
         }
 
-        let add_roles_attempt = member.add_roles(&context.http, &roles[0..]).await;
+        for role in roles {
+            if !member.roles.contains(&role.0) {
+                let role_add_attempt = context.http.add_member_role(
+                    member.server_id, 
+                    member.user_id, 
+                    role.0
+                ).await;
 
-        if let Err(error) = add_roles_attempt {
-            println!(
-                "error restoring roles for member {} in server {}: {:?}", 
-                simple_member.user_id, 
-                simple_member.server_id,
-                error,
-            );
+                if let Err(error) = role_add_attempt {
+                    println!(
+                        "error restoring role {} for member {} in server {}: {:?}", 
+                        role.0, 
+                        member.user_id, 
+                        member.server_id,
+                        error,
+                    );
+                } else {
+                    member.roles.push(role.0);
+                }
+           }
         }
     }
 
-    pub async fn observe_member(&self, context: &Context, member: Member) {
-        let last_seen: Vec<i64>;
+    async fn last_seen(&self, member: &SimpleMember) -> Option<i64> {
+        let connection = (&self.data).lock().await;
+        let mut last_seen_query = connection.prepare(
+            "SELECT time FROM last_seen 
+            WHERE user_id=?1 AND server_id=?2",
+        ).unwrap();
 
-        let simple_member = SimpleMember::from(&member);
-        {
-            let connection = (&self.data).lock().await;
-            let mut last_seen_query = connection.prepare(
-                "SELECT time FROM last_seen 
-                WHERE user_id=?1 AND server_id=?2",
-            ).unwrap();
-
-            last_seen = last_seen_query.query_map(
-                [simple_member.user_id, simple_member.server_id],
-                |row| row.get::<usize, i64>(0)
-            ).unwrap().collect::<Result<_>>().unwrap();
-        }
+        let last_seen: Vec<i64> = last_seen_query.query_map(
+            [member.user_id, member.server_id],
+            |row| row.get::<usize, i64>(0)
+        ).unwrap().collect::<Result<_>>().unwrap();
 
         assert!(last_seen.len() <= 1);
+        last_seen.get(0).and_then(|t| Some(*t))
+    }
 
-        if let Some(last_seen) = last_seen.get(0) {
-            if *last_seen < simple_member.joined_at {
-                // Member has left and rejoined since we last observed at them.
-                self.restore_member(context, member).await;
+    pub async fn observe_member(&self, context: &Context, member: &mut SimpleMember) {
+        let key: (UserId, GuildId) = (member.user_id.into(), member.server_id.into());
+        self.do_locked(key, || async {
+            if let Some(last_seen) = self.last_seen(member).await {
+                if last_seen < member.joined_at {
+                    // Member has left and rejoined since we last observed at them.
+                    self.restore_member(context, member).await;
+                }
             }
-        }
-
-        self.save_member(&simple_member).await;
+            
+            self.save_member(member).await;
+        }).await;
     }
 
     pub async fn save_guild(&self, context: &Context, server_id: GuildId) -> std::result::Result<(), serenity::Error> {
@@ -172,7 +200,7 @@ impl Handler {
         match result {
             Ok(members) => {
                 for member in members {
-                    self.observe_member(context, member).await
+                    self.observe_member(context, &mut member.into()).await
                 }
                 Ok(())
             },
@@ -210,23 +238,21 @@ impl Handler {
         FN: FnOnce() -> F,
     >(
         &self, 
-        user_id: UserId, 
-        guild_id: GuildId, 
-        function: FN
+        key: (UserId, GuildId),
+        function: FN,
     ) {
-        let key = (user_id, guild_id);
         let mut locks = self.member_locks.lock().await;
 
         if let Some(user_lock) = locks.get(&key) {
             std::mem::drop(locks);
             let _lock = user_lock.lock().await;
-            function().await
+            function().await;
         } else {
             let user_lock = Arc::new(Mutex::new(()));
             locks.insert(key, user_lock.clone());
             let _lock = user_lock.lock().await;
             std::mem::drop(locks);
-            function().await
+            function().await;
         }
     }
 }
@@ -268,29 +294,17 @@ impl EventHandler for Handler {
         member: Member
     ) {
         if self.filter_allow_server(guild_id) {
-            self.do_locked(
-                member.user.id, 
-                guild_id, 
-                || async { 
-                    self.restore_member(&context, member).await 
-                },
-            ).await;
+            self.observe_member(&context, &mut member.into()).await
         }
     }
     
     async fn guild_member_update(
         &self, 
-        _context: Context, 
+        context: Context, 
         update: GuildMemberUpdateEvent
     ) {
         if self.filter_allow_server(update.guild_id) {
-            self.do_locked(
-                update.user.id, 
-                update.guild_id, 
-                || async { 
-                    self.save_member(&(&update).into()).await;
-                }
-            ).await;
+            self.observe_member(&context, &mut update.into()).await
         }
     }
 }
