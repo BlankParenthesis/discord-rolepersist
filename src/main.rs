@@ -213,12 +213,12 @@ impl Handler {
         let transaction = connection.transaction().unwrap();
 
         transaction.execute(
-            "DELETE FROM roles WHERE server_id=?2",
+            "DELETE FROM roles WHERE server_id=?",
             [server_id.0],
         ).unwrap();
 
         transaction.execute(
-            "DELETE FROM last_seen WHERE server_id=?2",
+            "DELETE FROM last_seen WHERE server_id=?",
             [server_id.0],
         ).unwrap();
 

@@ -1,6 +1,6 @@
 [package]
 name = "discord-rolepersist"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["[  ] <blank.parenthesis@gmail.com>"]
 edition = "2018"
 
