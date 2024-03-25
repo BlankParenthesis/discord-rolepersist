@@ -3,15 +3,15 @@ use std::fmt;
 use std::sync::{Arc, Weak};
 
 use rusqlite::{Connection, Result};
+use serenity::all::UnavailableGuild;
 
 use std::future::Future;
 
 use serenity::{async_trait, prelude::*};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{UserId, GuildId, RoleId};
-use serenity::model::guild::{Member, Guild, GuildUnavailable};
+use serenity::model::guild::{Member, Guild};
 use serenity::model::event::GuildMemberUpdateEvent;
-use serenity::client::bridge::gateway::GatewayIntents;
 
 use serde::Deserialize;
 use serde::de::{Deserializer, Visitor};
@@ -28,10 +28,10 @@ struct SimpleMember {
 impl From<&Member> for SimpleMember {
     fn from(member: &Member) -> Self {
         SimpleMember {
-            joined_at: member.joined_at.unwrap().timestamp(),
-            user_id: member.user.id.0,
-            server_id: member.guild_id.0,
-            roles: member.roles.clone().into_iter().map(|r| r.0).collect(),
+            joined_at: member.joined_at.unwrap_or_default().unix_timestamp(),
+            user_id: member.user.id.get(),
+            server_id: member.guild_id.get(),
+            roles: member.roles.iter().cloned().map(|r| r.get()).collect(),
         }
     }
 }
@@ -45,10 +45,10 @@ impl From<Member> for SimpleMember {
 impl From<&GuildMemberUpdateEvent> for SimpleMember {
     fn from(member: &GuildMemberUpdateEvent) -> Self {
         SimpleMember {
-            joined_at: member.joined_at.timestamp(),
-            user_id: member.user.id.0,
-            server_id: member.guild_id.0,
-            roles: member.roles.clone().into_iter().map(|r| r.0).collect(),
+            joined_at: member.joined_at.unix_timestamp(),
+            user_id: member.user.id.get(),
+            server_id: member.guild_id.get(),
+            roles: member.roles.iter().cloned().map(|r| r.get()).collect(),
         }
     }
 }
@@ -99,7 +99,7 @@ impl Handler {
         let now = std::time::SystemTime::now();
         let since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap();
 
-        let mut connection = (&self.data).lock().await;
+        let mut connection = self.data.lock().await;
         let transaction = connection.transaction().unwrap();
 
         transaction.execute(
@@ -127,45 +127,45 @@ impl Handler {
         context: &Context, 
         member: &mut SimpleMember
     ) {
-        let connection = (&self.data).lock().await;
-        let roles: Vec<RoleId>;
-        {
+        let connection = self.data.lock().await;
+        let roles: Vec<RoleId> = {
             let mut roles_query = connection.prepare(
                 "SELECT role_id FROM roles 
                 WHERE user_id=?1 AND server_id=?2",
             ).unwrap();
 
-            roles = roles_query.query_map(
+            roles_query.query_map(
                 [member.user_id, member.server_id],
-                |row| Ok(RoleId(row.get(0)?))
-            ).unwrap().collect::<Result<_>>().unwrap();
-        }
+                |row| Ok(RoleId::new(row.get(0)?))
+            ).unwrap().collect::<Result<_>>().unwrap()
+        };
 
         for role in roles {
-            if !member.roles.contains(&role.0) {
+            if !member.roles.contains(&role.get()) {
                 let role_add_attempt = context.http.add_member_role(
-                    member.server_id, 
-                    member.user_id, 
-                    role.0
+                    GuildId::new(member.server_id), 
+                    UserId::new(member.user_id), 
+                    role,
+                    Some("Granting previously assigned roles"),
                 ).await;
 
                 if let Err(error) = role_add_attempt {
                     println!(
                         "error restoring role {} for member {} in server {}: {:?}", 
-                        role.0, 
+                        role.get(), 
                         member.user_id, 
                         member.server_id,
                         error,
                     );
                 } else {
-                    member.roles.push(role.0);
+                    member.roles.push(role.get());
                 }
            }
         }
     }
 
     async fn last_seen(&self, member: &SimpleMember) -> Option<i64> {
-        let connection = (&self.data).lock().await;
+        let connection = self.data.lock().await;
         let mut last_seen_query = connection.prepare(
             "SELECT time FROM last_seen 
             WHERE user_id=?1 AND server_id=?2",
@@ -177,7 +177,7 @@ impl Handler {
         ).unwrap().collect::<Result<_>>().unwrap();
 
         assert!(last_seen.len() <= 1);
-        last_seen.get(0).and_then(|t| Some(*t))
+        last_seen.first().copied()
     }
 
     pub async fn observe_member(&self, context: &Context, member: &mut SimpleMember) {
@@ -195,7 +195,7 @@ impl Handler {
     }
 
     pub async fn save_guild(&self, context: &Context, server_id: GuildId) -> std::result::Result<(), serenity::Error> {
-        let result = context.http.get_guild_members(server_id.0, None, None).await;
+        let result = context.http.get_guild_members(server_id, None, None).await;
 
         match result {
             Ok(members) => {
@@ -209,17 +209,17 @@ impl Handler {
     }
 
     pub async fn forget_guild(&self, server_id: GuildId) {
-        let mut connection = (&self.data).lock().await;
+        let mut connection = self.data.lock().await;
         let transaction = connection.transaction().unwrap();
 
         transaction.execute(
             "DELETE FROM roles WHERE server_id=?",
-            [server_id.0],
+            [server_id.get()],
         ).unwrap();
 
         transaction.execute(
             "DELETE FROM last_seen WHERE server_id=?",
-            [server_id.0],
+            [server_id.get()],
         ).unwrap();
 
         transaction.commit().unwrap();
@@ -227,7 +227,7 @@ impl Handler {
 
     pub fn filter_allow_server(&self, id: GuildId) -> bool {
         if let Some(restrict) = &self.config.restrict {
-            restrict.is_restricted(id.0)
+            restrict.is_restricted(id.get())
         } else {
             true
         }
@@ -259,41 +259,34 @@ impl Handler {
 
 #[async_trait]
 impl EventHandler for Handler {
-    async fn ready(
-        &self, 
-        context: Context, 
-        ready: Ready
-    ) {
+    async fn ready(&self, context: Context, ready: Ready) {
         let guilds: Vec<_> = ready.guilds.into_iter()
-            .filter(|guild| self.filter_allow_server(guild.id()))
+            .filter(|guild| self.filter_allow_server(guild.id))
             .collect();
         
         for guild in guilds {
-            if let Err(error) = self.save_guild(&context, guild.id()).await {
-                println!("Error fetching members of guild {}: {}", guild.id(), error);
+            if let Err(error) = self.save_guild(&context, guild.id).await {
+                println!("Error fetching members of guild {}: {}", guild.id, error);
             }
         }
     }
 
-    async fn guild_create(&self, context: Context, guild: Guild) {
+    async fn guild_create(&self, context: Context, guild: Guild, _is_new: Option<bool>) {
         if self.filter_allow_server(guild.id) {
             if let Err(error) = self.save_guild(&context, guild.id).await {
-                println!("Error fetching members of guild {}: {}", guild.id.0, error);
+                println!("Error fetching members of guild {}: {}", guild.id.get(), error);
             }
         }
     }
 
-    async fn guild_delete(&self, _context: Context, guild: GuildUnavailable) {
-        self.forget_guild(guild.id).await;
+    async fn guild_delete(&self, _context: Context, guild: UnavailableGuild, _full: Option<Guild>) {
+        if !guild.unavailable {
+            self.forget_guild(guild.id).await;
+        }
     }
         
-    async fn guild_member_addition(
-        &self, 
-        context: Context, 
-        guild_id: GuildId, 
-        member: Member
-    ) {
-        if self.filter_allow_server(guild_id) {
+    async fn guild_member_addition(&self, context: Context, member: Member) {
+        if self.filter_allow_server(member.guild_id) {
             self.observe_member(&context, &mut member.into()).await
         }
     }
@@ -301,6 +294,8 @@ impl EventHandler for Handler {
     async fn guild_member_update(
         &self, 
         context: Context, 
+        _old: Option<Member>,
+        _new: Option<Member>,
         update: GuildMemberUpdateEvent
     ) {
         if self.filter_allow_server(update.guild_id) {
@@ -349,9 +344,9 @@ struct Restriction {
 
 impl Restriction {
     pub fn is_restricted(&self, server_id: u64) -> bool {
-        let is_listed = (&self.servers).into_iter()
+        let is_listed = self.servers.iter()
             .find(|id| **id == server_id);
-        
+
         match self.mode {
             RestrictionMode::Allow => is_listed.is_some(),
             RestrictionMode::Deny => is_listed.is_none(),
@@ -373,11 +368,10 @@ async fn main() {
         .expect("Unable to parse config file");
 
     let token = config.token.clone();
-        
+    let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_MEMBERS;
     let handler = Handler::new(config).unwrap();
 
-    let mut client = Client::builder(&token)
-        .intents(GatewayIntents::GUILDS | GatewayIntents::GUILD_MEMBERS)
+    let mut client = Client::builder(&token, intents)
         .event_handler(handler).await
         .unwrap();
     

@@ -5,9 +5,9 @@ authors = ["[  ] <blank.parenthesis@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-serenity = { version = "0.10.7", default-features = false, features = ["client", "gateway", "rustls_backend", "model"] }
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "rustls_backend", "model"] }
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
-rusqlite = "0.25.3"
+rusqlite = "0.31"
 futures = "0.3.15"
 serde = "1.0.117"
 serde_json = "1.0.59"
